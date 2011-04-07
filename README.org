@@ -1,0 +1,16 @@
+#+title: Extensible Register System
+
+* Example - Store last keyboard macro to a register
+: (define-key ctl-x-r-map "x" 'kmacro-to-register)
+: (defun kmacro-to-register (name)
+:   "Store last keyboard macro to a register."
+:   (interactive "cLast keyboard macro to register: ")
+:   (register-make name last-kbd-macro
+:                  :jump-func (lambda (val)
+:                               (let ((last-kbd-macro val))
+:                                 (call-last-kbd-macro)))
+:                  :print-func (lambda (val)
+:                                (princ (format "a keyboard macro:\n   %s"
+:                                               (format-kbd-macro val))))
+:                  :insert-func (lambda (val)
+:                                 (insert (format-kbd-macro val)))))
