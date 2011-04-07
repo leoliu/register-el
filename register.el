@@ -117,37 +117,8 @@ use `register-find' and `register-value' instead." "24.1")
   "Return the value of register named NAME or nil if none."
   (ignore-errors (register-value (register-find name :error))))
 
-(defun point-to-register (name &optional arg)
-  "Store current location of point in a register.
-With prefix argument, store current frame configuration.
-Use \\[jump-to-register] to go to that location or restore that configuration.
-Argument is a character, naming the register."
-  (interactive "cPoint to register: \nP")
-  ;; Turn the marker into a file-ref if the buffer is killed.
-  (add-hook 'kill-buffer-hook 'register-swap-out nil t)
-  (register-make name
-		 (if arg (list (current-frame-configuration) (point-marker))
-		   (point-marker))))
+(define-obsolete-function-alias 'register-to-point 'jump-to-register "24.1")
 
-(defun window-configuration-to-register (name &optional arg)
-  "Store the window configuration of the selected frame in a register.
-Use \\[jump-to-register] to restore the configuration.
-Argument is a character, naming the register."
-  (interactive "cWindow configuration to register: \nP")
-  ;; current-window-configuration does not include the value
-  ;; of point in the current buffer, so record that separately.
-  (register-make name (list (current-window-configuration) (point-marker))))
-
-(defun frame-configuration-to-register (name &optional arg)
-  "Store the window configuration of all frames in a register.
-Use \\[jump-to-register] to restore the configuration.
-Argument is a character, naming the register."
-  (interactive "cFrame configuration to register: \nP")
-  ;; current-frame-configuration does not include the value
-  ;; of point in the current buffer, so record that separately.
-  (register-make name (list (current-frame-configuration) (point-marker))))
-
-(defalias 'register-to-point 'jump-to-register)
 (defun jump-to-register (name &optional delete)
   "Move point to location stored in a register.
 If the register contains a file name, find that file.
@@ -163,18 +134,7 @@ delete any existing frames that the frame configuration doesn't mention.
 	 (val (register-value register))
 	 (jump-func (register-jump-func register)))
     (cond
-     (jump-func (funcall jump-func val))
-     ((and (consp val) (frame-configuration-p (car val)))
-      (set-frame-configuration (car val) (not delete))
-      (goto-char (cadr val)))
-     ((and (consp val) (window-configuration-p (car val)))
-      (set-window-configuration (car val))
-      (goto-char (cadr val)))
-     ((markerp val)
-      (or (marker-buffer val)
-	  (error "That register's buffer no longer exists"))
-      (switch-to-buffer (marker-buffer val))
-      (goto-char val))
+     (jump-func (funcall jump-func val delete))
      ((and (consp val) (eq (car val) 'file))
       (find-file (cdr val)))
      ((and (consp val) (eq (car val) 'file-query))
@@ -185,44 +145,6 @@ delete any existing frames that the frame configuration doesn't mention.
       (goto-char (nth 2 val)))
      (t
       (error "Register doesn't contain a buffer position or configuration")))))
-
-(defun register-swap-out ()
-  "Turn markers into file-query references when a buffer is killed."
-  (and buffer-file-name
-       (register-map
-	(lambda (register)
-	  (let ((val (register-value register)))
-	    (and (markerp val)
-		 (eq (marker-buffer val) (current-buffer))
-		 (register-make (register-name register)
-				(list 'file-query
-				      buffer-file-name
-				      (marker-position val)))))))))
-
-(defun number-to-register (number name)
-  "Store a number in a register.
-Two args, NUMBER and NAME (a character, naming the register).
-If NUMBER is nil, a decimal number is read from the buffer starting
-at point, and point moves to the end of that number.
-Interactively, NUMBER is the prefix arg (none means nil)."
-  (interactive "P\ncNumber to register: ")
-  (register-make name
-		 (if number
-		     (prefix-numeric-value number)
-		   (if (looking-at "\\s-*-?[0-9]+")
-		       (progn
-			 (goto-char (match-end 0))
-			 (string-to-number (match-string 0)))
-		     0))))
-
-(defun increment-register (number name)
-  "Add NUMBER to the value of the register named NAME.
-Interactively, NUMBER is the prefix arg."
-  (interactive "p\ncIncrement register: ")
-  (let ((register (register-find name :error)))
-    (or (numberp (register-value register))
-	(error "Register does not contain a number"))
-    (register-make name (+ number (register-value register)))))
 
 (defun view-register (name)
   "Display what is contained in register named NAME."
@@ -252,26 +174,8 @@ Interactively, NUMBER is the prefix arg."
   (let ((val (register-value register))
 	(print-func (register-print-func register)))
     (cond
-     (print-func (funcall print-func val))
-
-     ((numberp val)
-      (princ val))
-
-     ((markerp val)
-      (let ((buf (marker-buffer val)))
-	(if (null buf)
-	    (princ "a marker in no buffer")
-	  (princ "a buffer position:\n    buffer ")
-	  (princ (buffer-name buf))
-	  (princ ", position ")
-	  (princ (marker-position val)))))
-
-     ((and (consp val) (window-configuration-p (car val)))
-      (princ "a window configuration."))
-
-     ((and (consp val) (frame-configuration-p (car val)))
-      (princ "a frame configuration."))
-
+     (print-func (funcall print-func val verbose))
+     
      ((and (consp val) (eq (car val) 'file))
       (princ "the file ")
       (prin1 (cdr val))
@@ -284,39 +188,6 @@ Interactively, NUMBER is the prefix arg."
       (princ (car (cdr (cdr val))))
       (princ "."))
 
-     ((consp val)
-      (if verbose
-	  (progn
-	    (princ "the rectangle:\n")
-	    (while val
-	      (princ "    ")
-	      (princ (car val))
-	      (terpri)
-	      (setq val (cdr val))))
-	(princ "a rectangle starting with ")
-	(princ (car val))))
-
-     ((stringp val)
-      (if (eq yank-excluded-properties t)
-	  (set-text-properties 0 (length val) nil val)
-	(remove-list-of-text-properties 0 (length val)
-					yank-excluded-properties val))
-      (if verbose
-	  (progn
-	    (princ "the text:\n")
-	    (princ val))
-	(cond
-	 ;; Extract first N characters starting with first non-whitespace.
-	 ((string-match (format "[^ \t\n].\\{,%d\\}"
-				;; Deduct 6 for the spaces inserted below.
-				(min 20 (max 0 (- (window-width) 6))))
-			val)
-	  (princ "text starting with\n    ")
-	  (princ (match-string 0 val)))
-	 ((string-match "^[ \t\n]+$" val)
-	  (princ "whitespace"))
-	 (t
-	  (princ "the empty string")))))
      (t
       (princ "Garbage:\n")
       (if verbose (prin1 val))))))
@@ -331,17 +202,105 @@ Interactively, second arg is non-nil if prefix arg is supplied."
 	 (val (register-value register))
 	 (insert-func (register-insert-func register)))
     (push-mark)
-    (cond
-     (insert-func (funcall insert-func val))
-     ((stringp val)
-      (insert-for-yank val))
-     ((numberp val)
-      (princ val (current-buffer)))
-     ((and (markerp val) (marker-position val))
-      (princ (marker-position val) (current-buffer)))
-     (t
-      (error "Register does not contain text"))))
+    (if insert-func
+	(funcall insert-func val)
+      (error "Register does not contain text")))
   (if (not arg) (exchange-point-and-mark)))
+
+(defun increment-register (number name)
+  "Add NUMBER to the value of the register named NAME.
+Interactively, NUMBER is the prefix arg."
+  (interactive "p\ncIncrement register: ")
+  (let ((register (register-find name :error)))
+    (or (numberp (register-value register))
+	(error "Register does not contain a number"))
+    (register-make name (+ number (register-value register)))))
+
+(defun point-to-register (name &optional arg)
+  "Store current location of point in a register.
+With prefix argument, store current frame configuration.
+Use \\[jump-to-register] to go to that location or restore that configuration.
+Argument is a character, naming the register."
+  (interactive "cPoint to register: \nP")
+  ;; Turn the marker into a file-ref if the buffer is killed.
+  (add-hook 'kill-buffer-hook 'register-swap-out nil t)
+  (register-make name
+		 (if arg (list (current-frame-configuration) (point-marker))
+		   (point-marker))
+		 :print-func (lambda (val)
+			       (let ((buf (marker-buffer val)))
+				 (if (null buf)
+				     (princ "a marker in no buffer")
+				   (princ "a buffer position:\n    buffer ")
+				   (princ (buffer-name buf))
+				   (princ ", position ")
+				   (princ (marker-position val)))))
+		 :jump-func (lambda (val)
+			      (assert (marker-buffer val) nil "\
+That register's buffer no longer exists")
+			      (switch-to-buffer (marker-buffer val))
+			      (goto-char val))
+		 :insert-func (lambda (val)
+				(assert (marker-position val) nil
+					"Marker does not point anywhere")
+				(princ (marker-position val) (current-buffer)))))
+
+(defun register-swap-out ()
+  "Turn markers into file-query references when a buffer is killed."
+  (and buffer-file-name
+       (register-map
+	(lambda (register)
+	  (let ((val (register-value register)))
+	    (and (markerp val)
+		 (eq (marker-buffer val) (current-buffer))
+		 (register-make (register-name register)
+				(list 'file-query
+				      buffer-file-name
+				      (marker-position val)))))))))
+
+(defun window-configuration-to-register (name &optional arg)
+  "Store the window configuration of the selected frame in a register.
+Use \\[jump-to-register] to restore the configuration.
+Argument is a character, naming the register."
+  (interactive "cWindow configuration to register: \nP")
+  ;; current-window-configuration does not include the value
+  ;; of point in the current buffer, so record that separately.
+  (register-make name (list (current-window-configuration) (point-marker))
+		 :print-func (lambda (val) (princ "a window configuration."))
+		 :jump-func (lambda (val)
+			      (set-window-configuration (car val))
+			      (goto-char (cadr val)))))
+
+(defun frame-configuration-to-register (name &optional arg)
+  "Store the window configuration of all frames in a register.
+Use \\[jump-to-register] to restore the configuration.
+Argument is a character, naming the register."
+  (interactive "cFrame configuration to register: \nP")
+  ;; current-frame-configuration does not include the value
+  ;; of point in the current buffer, so record that separately.
+  (register-make name (list (current-frame-configuration) (point-marker))
+		 :print-func (lambda (val) (princ "a frame configuration."))
+		 :jump-func (lambda (val &optional delete)
+			      (set-frame-configuration (car val) (not delete))
+			      (goto-char (cadr val)))))
+
+(defun number-to-register (number name)
+  "Store a number in a register.
+Two args, NUMBER and NAME (a character, naming the register).
+If NUMBER is nil, a decimal number is read from the buffer starting
+at point, and point moves to the end of that number.
+Interactively, NUMBER is the prefix arg (none means nil)."
+  (interactive "P\ncNumber to register: ")
+  (register-make name
+		 (if number
+		     (prefix-numeric-value number)
+		   (if (looking-at "\\s-*-?[0-9]+")
+		       (progn
+			 (goto-char (match-end 0))
+			 (string-to-number (match-string 0)))
+		     0))
+		 :print-func (lambda (val) (princ val))
+		 :insert-func (lambda (val) (princ val (current-buffer)))))
 
 (defun copy-to-register (name start end &optional delete-flag)
   "Copy region into register named NAME.
@@ -349,7 +308,29 @@ With prefix arg, delete as well.
 Called from program, takes four args: REGISTER, START, END and DELETE-FLAG.
 START and END are buffer positions indicating what to copy."
   (interactive "cCopy to register: \nr\nP")
-  (register-make name (filter-buffer-substring start end))
+  (register-make name (filter-buffer-substring start end)
+		 :print-func (lambda (val &optional verbose)
+			       (if (eq yank-excluded-properties t)
+				   (set-text-properties 0 (length val) nil val)
+				 (remove-list-of-text-properties 0 (length val)
+								 yank-excluded-properties val))
+			       (if verbose
+				   (progn
+				     (princ "the text:\n")
+				     (princ val))
+				 (cond
+				  ;; Extract first N characters starting with first non-whitespace.
+				  ((string-match (format "[^ \t\n].\\{,%d\\}"
+							 ;; Deduct 6 for the spaces inserted below.
+							 (min 20 (max 0 (- (window-width) 6))))
+						 val)
+				   (princ "text starting with\n    ")
+				   (princ (match-string 0 val)))
+				  ((string-match "^[ \t\n]+$" val)
+				   (princ "whitespace"))
+				  (t
+				   (princ "the empty string")))))
+		 :insert-func #'insert-for-yank)
   (if delete-flag (delete-region start end)))
 
 (defun append-to-register (name start end &optional delete-flag)
@@ -362,7 +343,9 @@ START and END are buffer positions indicating what to append."
 	 (val (and register (register-value register)))
 	 (text (filter-buffer-substring start end)))
     (assert (string-or-null-p val) nil "Register does not contain text")
-    (register-make name (concat val text)))
+    (register-make name (concat val text)
+		   :print-func (and register (register-print-func register))
+		   :insert-func (and register (register-insert-func register))))
   (if delete-flag (delete-region start end)))
 
 (defun prepend-to-register (name start end &optional delete-flag)
@@ -375,7 +358,9 @@ START and END are buffer positions indicating what to prepend."
 	 (val (and register (register-value register)))
 	 (text (filter-buffer-substring start end)))
     (assert (string-or-null-p val) nil "Register does not contain text")
-    (register-make name (concat text val)))
+    (register-make name (concat text val)
+		   :print-func (and register (register-print-func register))
+		   :insert-func (and register (register-insert-func register))))
   (if delete-flag (delete-region start end)))
 
 (defun copy-rectangle-to-register (name start end &optional delete-flag)
@@ -390,6 +375,17 @@ START and END are buffer positions giving two corners of rectangle."
 		 (if delete-flag
 		     (delete-extract-rectangle start end)
 		   (extract-rectangle start end))
+		 :print-func (lambda (val &optional verbose)
+			       (if verbose
+				   (progn
+				     (princ "the rectangle:\n")
+				     (while val
+				       (princ "    ")
+				       (princ (car val))
+				       (terpri)
+				       (setq val (cdr val))))
+				 (princ "a rectangle starting with ")
+				 (princ (car val))))
 		 :insert-func #'insert-rectangle))
 
 (provide 'register)
