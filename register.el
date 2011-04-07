@@ -28,6 +28,8 @@
 ;; pieces of buffer state to named variables.  The entry points are
 ;; documented in the Emacs user's manual.
 
+(eval-when-compile (require 'cl))
+
 (declare-function semantic-insert-foreign-tag "semantic/tag" (foreign-tag))
 (declare-function semantic-tag-buffer "semantic/tag" (tag))
 (declare-function semantic-tag-start "semantic/tag" (tag))
@@ -50,9 +52,26 @@
 
 ;;; Code:
 
-(defvar register-alist nil
-  "Alist of elements (NAME . CONTENTS), one for each Emacs register.
-NAME is a character (a number).  CONTENTS is a string, number, marker or list.
+;;; In-memory persistency.
+(defvar register-hash-table (make-hash-table))
+
+;;; Immutable register object.
+(defstruct
+  (register (:constructor nil)
+	    (:constructor register--make (name &optional value print-func
+					       jump-func insert-func))
+	    (:copier nil)
+	    (:type list)
+	    :named)
+  (name	       nil :read-only t)
+  (value       nil :read-only t)
+  (print-func  nil :read-only t)
+  (jump-func   nil :read-only t)
+  (insert-func nil :read-only t))
+
+(defun* register-make (name value &key print-func jump-func insert-func)
+  "Return a newly created register with NAME and VALUE.
+VALUE may be a string, number, marker or list.
 A list of strings represents a rectangle.
 A list of the form (file . FILE-NAME) represents the file named FILE-NAME.
 A list of the form (file-query FILE-NAME POSITION) represents
@@ -61,53 +80,79 @@ A list of the form (file-query FILE-NAME POSITION) represents
 A list of the form (WINDOW-CONFIGURATION POSITION)
  represents a saved window configuration plus a saved value of point.
 A list of the form (FRAME-CONFIGURATION POSITION)
- represents a saved frame configuration plus a saved value of point.")
+ represents a saved frame configuration plus a saved value of point.
 
-(defun get-register (register)
-  "Return contents of Emacs register named REGISTER, or nil if none."
-  (cdr (assq register register-alist)))
+VALUE may also be any value.
 
-(defun set-register (register value)
-  "Set contents of Emacs register named REGISTER to VALUE.  Returns VALUE.
-See the documentation of the variable `register-alist' for possible VALUEs."
-  (let ((aelt (assq register register-alist)))
-    (if aelt
-	(setcdr aelt value)
-      (push (cons register value) register-alist))
-    value))
+PRINT-FUNC if provided controls how `list-registers' and
+`view-register' print the register.  It should be a function
+recieving one argument VALUE and print text that completes
+this sentence:
+  Register X contains [TEXT PRINTED BY PRINT-FUNC]
 
-(defun point-to-register (register &optional arg)
-  "Store current location of point in register REGISTER.
+JUMP-FUNC if provided, controls how `jump-to-register' jumps to the register.
+INSERT-FUNC if provided, controls how `insert-register' insert the register.
+They both receive the VALUE of the register as argument."
+  (let ((register (register--make name value print-func
+				  jump-func insert-func)))
+    (puthash name register register-hash-table)
+    register))
+
+(defun register-find (name &optional if-does-not-exist)
+  "Find the register named NAME and return it.
+If IF-DOES-NOT-EXIST is :error, signal an error; otherwise return nil."
+  (let ((register (gethash name register-hash-table)))
+    (or register (case if-does-not-exist
+		   (:error (error "Register named `%s' does not exist"
+				  (single-key-description name)))
+		   (otherwise nil)))))
+
+(defun register-map (function)
+  "Apply FUNCTION to each register for side effects only.
+FUNCTION should accept one argument - the register."
+  (maphash (lambda (name register)
+	     (funcall function register)) register-hash-table))
+
+(define-obsolete-function-alias 'set-register 'register-make "24.1")
+(make-obsolete 'get-register "\
+use `register-find' and `register-value' instead." "24.1")
+
+(defun get-register (name)
+  "Return the value of register named NAME or nil if none."
+  (ignore-errors (register-value (register-find name :error))))
+
+(defun point-to-register (name &optional arg)
+  "Store current location of point in a register.
 With prefix argument, store current frame configuration.
 Use \\[jump-to-register] to go to that location or restore that configuration.
 Argument is a character, naming the register."
   (interactive "cPoint to register: \nP")
   ;; Turn the marker into a file-ref if the buffer is killed.
   (add-hook 'kill-buffer-hook 'register-swap-out nil t)
-  (set-register register
-		(if arg (list (current-frame-configuration) (point-marker))
-		  (point-marker))))
+  (register-make name
+		 (if arg (list (current-frame-configuration) (point-marker))
+		   (point-marker))))
 
-(defun window-configuration-to-register (register &optional arg)
-  "Store the window configuration of the selected frame in register REGISTER.
+(defun window-configuration-to-register (name &optional arg)
+  "Store the window configuration of the selected frame in a register.
 Use \\[jump-to-register] to restore the configuration.
 Argument is a character, naming the register."
   (interactive "cWindow configuration to register: \nP")
   ;; current-window-configuration does not include the value
   ;; of point in the current buffer, so record that separately.
-  (set-register register (list (current-window-configuration) (point-marker))))
+  (register-make name (list (current-window-configuration) (point-marker))))
 
-(defun frame-configuration-to-register (register &optional arg)
-  "Store the window configuration of all frames in register REGISTER.
+(defun frame-configuration-to-register (name &optional arg)
+  "Store the window configuration of all frames in a register.
 Use \\[jump-to-register] to restore the configuration.
 Argument is a character, naming the register."
   (interactive "cFrame configuration to register: \nP")
   ;; current-frame-configuration does not include the value
   ;; of point in the current buffer, so record that separately.
-  (set-register register (list (current-frame-configuration) (point-marker))))
+  (register-make name (list (current-frame-configuration) (point-marker))))
 
 (defalias 'register-to-point 'jump-to-register)
-(defun jump-to-register (register &optional delete)
+(defun jump-to-register (name &optional delete)
   "Move point to location stored in a register.
 If the register contains a file name, find that file.
 \(To put a file name in a register, you must use `set-register'.)
@@ -118,8 +163,11 @@ Optional second arg non-nil (interactively, prefix argument) says to
 delete any existing frames that the frame configuration doesn't mention.
 \(Otherwise, these frames are iconified.)"
   (interactive "cJump to register: \nP")
-  (let ((val (get-register register)))
+  (let* ((register (register-find name :error))
+	 (val (register-value register))
+	 (jump-func (register-jump-func register)))
     (cond
+     (jump-func (funcall jump-func val))
      ((and (consp val) (frame-configuration-p (car val)))
       (set-frame-configuration (car val) (not delete))
       (goto-char (cadr val)))
@@ -150,65 +198,71 @@ delete any existing frames that the frame configuration doesn't mention.
 (defun register-swap-out ()
   "Turn markers into file-query references when a buffer is killed."
   (and buffer-file-name
-       (dolist (elem register-alist)
-	 (and (markerp (cdr elem))
-	      (eq (marker-buffer (cdr elem)) (current-buffer))
-	      (setcdr elem
-		      (list 'file-query
-			    buffer-file-name
-			    (marker-position (cdr elem))))))))
+       (register-map
+	(lambda (register)
+	  (let ((val (register-value register)))
+	    (and (markerp val)
+		 (eq (marker-buffer val) (current-buffer))
+		 (register-make (register-name register)
+				(list 'file-query
+				      buffer-file-name
+				      (marker-position val)))))))))
 
-(defun number-to-register (number register)
+(defun number-to-register (number name)
   "Store a number in a register.
-Two args, NUMBER and REGISTER (a character, naming the register).
+Two args, NUMBER and NAME (a character, naming the register).
 If NUMBER is nil, a decimal number is read from the buffer starting
 at point, and point moves to the end of that number.
 Interactively, NUMBER is the prefix arg (none means nil)."
   (interactive "P\ncNumber to register: ")
-  (set-register register
-		(if number
-		    (prefix-numeric-value number)
-		  (if (looking-at "\\s-*-?[0-9]+")
-		      (progn
-			(goto-char (match-end 0))
-			(string-to-number (match-string 0)))
-		    0))))
+  (register-make name
+		 (if number
+		     (prefix-numeric-value number)
+		   (if (looking-at "\\s-*-?[0-9]+")
+		       (progn
+			 (goto-char (match-end 0))
+			 (string-to-number (match-string 0)))
+		     0))))
 
-(defun increment-register (number register)
-  "Add NUMBER to the contents of register REGISTER.
+(defun increment-register (number name)
+  "Add NUMBER to the value of the register named NAME.
 Interactively, NUMBER is the prefix arg."
   (interactive "p\ncIncrement register: ")
-  (or (numberp (get-register register))
-      (error "Register does not contain a number"))
-  (set-register register (+ number (get-register register))))
+  (let ((register (register-find name :error)))
+    (or (numberp (register-value register))
+	(error "Register does not contain a number"))
+    (register-make name (+ number (register-value register)))))
 
-(defun view-register (register)
-  "Display what is contained in register named REGISTER.
-The Lisp value REGISTER is a character."
+(defun view-register (name)
+  "Display what is contained in register named NAME."
   (interactive "cView register: ")
-  (let ((val (get-register register)))
-    (if (null val)
-	(message "Register %s is empty" (single-key-description register))
-      (with-output-to-temp-buffer "*Output*"
-	(describe-register-1 register t)))))
+  (let* ((register (register-find name :error))
+	 (val (register-value register)))
+    (with-output-to-temp-buffer "*Output*"
+      (describe-register-1 register t))))
 
 (defun list-registers ()
   "Display a list of nonempty registers saying briefly what they contain."
   (interactive)
-  (let ((list (copy-sequence register-alist)))
-    (setq list (sort list (lambda (a b) (< (car a) (car b)))))
+  (let (names register)
+    (register-map (lambda (r) (push (register-name r) names)))
+    (setq names (sort names '<))
     (with-output-to-temp-buffer "*Output*"
-      (dolist (elt list)
-	(when (get-register (car elt))
-	  (describe-register-1 (car elt))
+      (dolist (name names)
+	(setq register (register-find name))
+	(when (and register (register-value register))
+	  (describe-register-1 register)
 	  (terpri))))))
 
 (defun describe-register-1 (register &optional verbose)
   (princ "Register ")
-  (princ (single-key-description register))
+  (princ (single-key-description (register-name register)))
   (princ " contains ")
-  (let ((val (get-register register)))
+  (let ((val (register-value register))
+	(print-func (register-print-func register)))
     (cond
+     (print-func (funcall print-func val))
+
      ((numberp val)
       (princ val))
 
@@ -276,17 +330,18 @@ The Lisp value REGISTER is a character."
       (princ "Garbage:\n")
       (if verbose (prin1 val))))))
 
-(defun insert-register (register &optional arg)
-  "Insert contents of register REGISTER.  (REGISTER is a character.)
+(defun insert-register (name &optional arg)
+  "Insert the value of the register named NAME.
 Normally puts point before and mark after the inserted text.
 If optional second arg is non-nil, puts mark before and point after.
 Interactively, second arg is non-nil if prefix arg is supplied."
   (interactive "*cInsert register: \nP")
-  (push-mark)
-  (let ((val (get-register register)))
+  (let* ((register (register-find name :error))
+	 (val (register-value register))
+	 (insert-func (register-insert-func register)))
+    (push-mark)
     (cond
-     ((consp val)
-      (insert-rectangle val))
+     (insert-func (funcall insert-func val))
      ((stringp val)
       (insert-for-yank val))
      ((numberp val)
@@ -301,55 +356,54 @@ Interactively, second arg is non-nil if prefix arg is supplied."
       (error "Register does not contain text"))))
   (if (not arg) (exchange-point-and-mark)))
 
-(defun copy-to-register (register start end &optional delete-flag)
-  "Copy region into register REGISTER.
+(defun copy-to-register (name start end &optional delete-flag)
+  "Copy region into register named NAME.
 With prefix arg, delete as well.
 Called from program, takes four args: REGISTER, START, END and DELETE-FLAG.
 START and END are buffer positions indicating what to copy."
   (interactive "cCopy to register: \nr\nP")
-  (set-register register (filter-buffer-substring start end))
+  (register-make name (filter-buffer-substring start end))
   (if delete-flag (delete-region start end)))
 
-(defun append-to-register (register start end &optional delete-flag)
-  "Append region to text in register REGISTER.
+(defun append-to-register (name start end &optional delete-flag)
+  "Append region to text in register named NAME.
 With prefix arg, delete as well.
 Called from program, takes four args: REGISTER, START, END and DELETE-FLAG.
 START and END are buffer positions indicating what to append."
   (interactive "cAppend to register: \nr\nP")
-  (let ((reg (get-register register))
-        (text (filter-buffer-substring start end)))
-    (set-register
-     register (cond ((not reg) text)
-                    ((stringp reg) (concat reg text))
-                    (t (error "Register does not contain text")))))
+  (let* ((register (register-find name))
+	 (val (and register (register-value register)))
+	 (text (filter-buffer-substring start end)))
+    (assert (string-or-null-p val) nil "Register does not contain text")
+    (register-make name (concat val text)))
   (if delete-flag (delete-region start end)))
 
-(defun prepend-to-register (register start end &optional delete-flag)
-  "Prepend region to text in register REGISTER.
+(defun prepend-to-register (name start end &optional delete-flag)
+  "Prepend region to text in register named NAME.
 With prefix arg, delete as well.
 Called from program, takes four args: REGISTER, START, END and DELETE-FLAG.
 START and END are buffer positions indicating what to prepend."
   (interactive "cPrepend to register: \nr\nP")
-  (let ((reg (get-register register))
-        (text (filter-buffer-substring start end)))
-    (set-register
-     register (cond ((not reg) text)
-                    ((stringp reg) (concat text reg))
-                    (t (error "Register does not contain text")))))
+  (let* ((register (register-find name))
+	 (val (and register (register-value register)))
+	 (text (filter-buffer-substring start end)))
+    (assert (string-or-null-p val) nil "Register does not contain text")
+    (register-make name (concat text val)))
   (if delete-flag (delete-region start end)))
 
-(defun copy-rectangle-to-register (register start end &optional delete-flag)
-  "Copy rectangular region into register REGISTER.
+(defun copy-rectangle-to-register (name start end &optional delete-flag)
+  "Copy rectangular region into register named NAME.
 With prefix arg, delete as well.
 To insert this register in the buffer, use \\[insert-register].
 
 Called from a program, takes four args: REGISTER, START, END and DELETE-FLAG.
 START and END are buffer positions giving two corners of rectangle."
   (interactive "cCopy rectangle to register: \nr\nP")
-  (set-register register
-		(if delete-flag
-		    (delete-extract-rectangle start end)
-		  (extract-rectangle start end))))
+  (register-make name
+		 (if delete-flag
+		     (delete-extract-rectangle start end)
+		   (extract-rectangle start end))
+		 :insert-func #'insert-rectangle))
 
 (provide 'register)
 ;;; register.el ends here
