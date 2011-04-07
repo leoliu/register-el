@@ -28,12 +28,6 @@
 ;; pieces of buffer state to named variables.  The entry points are
 ;; documented in the Emacs user's manual.
 
-(eval-when-compile (require 'cl))
-
-(declare-function semantic-insert-foreign-tag "semantic/tag" (foreign-tag))
-(declare-function semantic-tag-buffer "semantic/tag" (tag))
-(declare-function semantic-tag-start "semantic/tag" (tag))
-
 ;;; Global key bindings
 
 (define-key ctl-x-r-map "\C-@" 'point-to-register)
@@ -51,6 +45,8 @@
 (define-key ctl-x-r-map "f" 'frame-configuration-to-register)
 
 ;;; Code:
+
+(eval-when-compile (require 'cl))
 
 ;;; In-memory persistency.
 (defvar register-hash-table (make-hash-table))
@@ -187,11 +183,6 @@ delete any existing frames that the frame configuration doesn't mention.
 	  (error "Register access aborted"))
       (find-file (nth 1 val))
       (goto-char (nth 2 val)))
-     ((and (fboundp 'semantic-foreign-tag-p)
-	   semantic-mode
-	   (semantic-foreign-tag-p val))
-      (switch-to-buffer (semantic-tag-buffer val))
-      (goto-char (semantic-tag-start val)))
      (t
       (error "Register doesn't contain a buffer position or configuration")))))
 
@@ -348,10 +339,6 @@ Interactively, second arg is non-nil if prefix arg is supplied."
       (princ val (current-buffer)))
      ((and (markerp val) (marker-position val))
       (princ (marker-position val) (current-buffer)))
-     ((and (fboundp 'semantic-foreign-tag-p)
-	   semantic-mode
-	   (semantic-foreign-tag-p val))
-      (semantic-insert-foreign-tag val))
      (t
       (error "Register does not contain text"))))
   (if (not arg) (exchange-point-and-mark)))
