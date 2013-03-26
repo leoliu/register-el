@@ -1,5 +1,9 @@
 #+title: Extensible Register System
 
+* [2013-03-26 Tue] Merged upstream
+  Mostly merged upstream (see: =registerv-make=) so no longer needed for
+  recent emacsen (24.x).
+
 * Example - Store last keyboard macro to a register
 : (define-key ctl-x-r-map "x" 'kmacro-to-register)
 : (defun kmacro-to-register (name)
